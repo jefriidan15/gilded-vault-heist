@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>The Gilded Vault — a heist game</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; padding: 0; background: #0a0a12; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; font-family: Georgia, 'Times New Roman', serif; }
+  #wrap { position: relative; width: 1280px; height: 720px; }
+  canvas { display: block; width: 1280px; height: 720px; background: #14141f; }
+  #hud {
+    position: absolute; top: 0; left: 0; right: 0; height: 46px;
+    display: flex; align-items: center; gap: 18px; padding: 0 16px;
+    background: rgba(8, 8, 16, 0.88); color: #f5e9c8;
+    font-family: Verdana, sans-serif; font-size: 14px; user-select: none;
+  }
+  #hud .title { font-family: Georgia, serif; font-size: 17px; color: #ffd76a; letter-spacing: 1px; }
+  #hud .spacer { flex: 1; }
+  #alarmWrap { display: flex; align-items: center; gap: 8px; }
+  #alarmBarOuter { width: 190px; height: 14px; background: #2a2a33; border: 1px solid #888; border-radius: 7px; overflow: hidden; }
+  #alarmBar { height: 100%; width: 0%; background: #3fae5a; transition: width 0.15s linear, background 0.2s; }
+  #loot { color: #ffd76a; }
+  #timer { color: #cfe3ff; }
+  #state { font-weight: bold; }
+  #help { position: absolute; bottom: 6px; left: 12px; color: rgba(245,233,200,0.65); font-family: Verdana, sans-serif; font-size: 12px; user-select: none; }
+  #overlay {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+    background: rgba(6, 6, 14, 0.72); color: #f5e9c8; z-index: 5;
+  }
+  #overlay h1 { font-size: 54px; margin: 0 0 8px; color: #ffd76a; letter-spacing: 2px; text-shadow: 0 0 24px rgba(255, 215, 106, 0.45); }
+  #overlay h2 { font-size: 20px; margin: 0 0 18px; font-weight: normal; color: #d8cba6; }
+  #overlay p { font-size: 15px; line-height: 1.6; max-width: 640px; margin: 6px 0; font-family: Verdana, sans-serif; }
+  #overlay .big { font-size: 22px; color: #ffd76a; }
+  #overlay button {
+    margin-top: 20px; padding: 12px 34px; font-size: 18px; font-family: Georgia, serif;
+    background: #c9a227; color: #14100a; border: none; border-radius: 6px; cursor: pointer;
+  }
+  #overlay button:hover { background: #ffd76a; }
+  #overlay .keys { color: #9fb6d8; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="1280" height="720"></canvas>
+  <div id="hud">
+    <span class="title">THE GILDED VAULT</span>
+    <span id="alarmWrap">ALARM <span id="alarmBarOuter"><span id="alarmBar"></span></span><span id="alarmPct">0%</span></span>
+    <span id="loot">LOOT 0/3</span>
+    <span id="timer">00:00</span>
+    <span class="spacer"></span>
+    <span id="state">GUARDS: CALM</span>
+  </div>
+  <div id="help">WASD / arrows — move &nbsp;·&nbsp; Shift — sneak &nbsp;·&nbsp; E — grab loot &nbsp;·&nbsp; Click — walk there &nbsp;·&nbsp; R — restart &nbsp;·&nbsp; M — mute</div>
+  <div id="overlay"></div>
+</div>
+<script>
+'use strict';
+/* The Gilded Vault — an original top-down heist game.
+   You are Mara, a thief crossing the gilded gallery at night.
+   Steal the vault gold, the portrait and the safe contents, then
+   slip out the service door before the alarm fills. */
+
+// ---------- seeded RNG (deterministic layout jitter) ----------
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rng = mulberry32(20261122);
+
+// ---------- canvas ----------
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = 1280, H = 720, HUD_H = 46;
+const FLOOR = { x: 24, y: HUD_H + 16, w: W - 48, h: H - HUD_H - 40 };
+
+// ---------- level: walls, cover, shadows ----------
+// Walls are solid rectangles; cover blocks sight AND movement; shadows hide you.
+const walls = [
+  { x: FLOOR.x, y: FLOOR.y, w: FLOOR.w, h: 10 },                       // top
+  { x: FLOOR.x, y: FLOOR.y + FLOOR.h - 10, w: FLOOR.w, h: 10 },        // bottom
+  { x: FLOOR.x, y: FLOOR.y, w: 10, h: FLOOR.h },                       // left
+  { x: FLOOR.x + FLOOR.w - 10, y: FLOOR.y, w: 10, h: FLOOR.h },        // right
+  { x: 420, y: FLOOR.y + 218, w: 14, h: 120 },                         // gallery divider A (leaves the 240 and 470 patrol lanes clear)
+  { x: 830, y: FLOOR.y + 240, w: 14, h: 190 },                         // gallery divider B
+  { x: 560, y: FLOOR.y + 60, w: 220, h: 14 },                          // vault antechamber wall
+  { x: 560, y: FLOOR.y + 60, w: 14, h: 90 },                           // vault antechamber side (short: leaves the 240 patrol lane clear)
+];
+const cover = [ // crates, display cases, statues: block sight + movement
+  { x: 150, y: 300, w: 90, h: 60, kind: 'crate' },
+  { x: 330, y: 150, w: 70, h: 70, kind: 'case' },
+  { x: 640, y: 320, w: 110, h: 56, kind: 'case' },
+  { x: 950, y: 140, w: 80, h: 80, kind: 'statue' },
+  { x: 1010, y: 300, w: 90, h: 60, kind: 'crate' },
+  { x: 200, y: 540, w: 80, h: 60, kind: 'crate' },
+  { x: 500, y: 520, w: 70, h: 70, kind: 'statue' },
+];
+const shadows = [ // dark patches: suspicion drains here
+  { x: 90, y: 430, w: 130, h: 90 },
+  { x: 700, y: 120, w: 150, h: 80 },
+  { x: 1080, y: 300, w: 120, h: 110 },
+  { x: 330, y: 560, w: 140, h: 70 },
+];
+const solids = walls.concat(cover);
+
+// ---------- loot, exit, cameras ----------
+const lootItems = [
+  { id: 'vault', name: 'Vault Gold', x: 700, y: 150, r: 22, taken: false, color: '#ffd76a', glyph: '$' },
+  { id: 'portrait', name: 'The Gilded Portrait', x: 130, y: 150, r: 20, taken: false, color: '#e58fb1', glyph: 'P' },
+  { id: 'safe', name: 'Safe Contents', x: 1130, y: 580, r: 22, taken: false, color: '#8fd8e5', glyph: 'S' },
+];
+const exitDoor = { x: FLOOR.x + 4, y: FLOOR.y + FLOOR.h - 74, w: 66, h: 60 };
+const cameras = [
+  { x: 640, y: FLOOR.y + 12, base: Math.PI / 2, arc: 0.9, range: 270, speed: 0.45, phase: 0 },
+  { x: 1232, y: 380, base: Math.PI, arc: 0.8, range: 260, speed: 0.6, phase: 2.1 },
+];
+
+// ---------- guards ----------
+function makeGuard(waypoints, speed, pause) {
+  return {
+    waypoints, speed, pause,
+    x: waypoints[0][0], y: waypoints[0][1],
+    wp: 1, dir: 0, wait: 0,
+    state: 'calm', suspicion: 0, chaseT: 0, returnT: 0,
+    lastSeenX: 0, lastSeenY: 0,
+  };
+}
+const guards = [
+  makeGuard([[300, 240], [760, 240], [760, 470], [300, 470]], 62, 1.2),
+  makeGuard([[980, 240], [980, 560], [1120, 560], [1120, 240]], 70, 0.9),
+  makeGuard([[180, 620], [620, 620], [620, 420], [180, 420]], 58, 1.5),
+];
+// small deterministic jitter so patrols do not look robotic
+guards.forEach(function (g) { g.dir = rng() * Math.PI * 2; });
+
+// ---------- player ----------
+const player = {
+  x: 90, y: 640, r: 14, speed: 175, sneakSpeed: 92,
+  sneaking: false, moving: false, facing: -Math.PI / 2,
+  clickX: null, clickY: null,
+  detourX: null, detourY: null, detoursUsed: 0,
+  stuckX: 90, stuckY: 640, stuckSince: 0,
+};
+let alarm = 0;            // 0..100, full = caught
+let lootCount = 0;
+let elapsed = 0;
+let phase = 'title';      // title | playing | won | lost
+let endReason = '';
+let muted = false;
+let shake = 0;
+
+// ---------- audio (synthesized, no files) ----------
+let audioCtx = null;
+function ac() {
+  if (!audioCtx) { try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { audioCtx = null; } }
+  return audioCtx;
+}
+function blip(freq, dur, type, vol, slideTo) {
+  if (muted) return;
+  const c = ac(); if (!c) return;
+  try {
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type || 'sine'; o.frequency.setValueAtTime(freq, c.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, c.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.12, c.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + dur);
+    o.connect(g); g.connect(c.destination);
+    o.start(); o.stop(c.currentTime + dur);
+  } catch (e) { /* audio is decoration; never break the game */ }
+}
+const sfx = {
+  step: function () { blip(190 + rng() * 40, 0.05, 'triangle', 0.03); },
+  pickup: function () { blip(660, 0.12, 'sine', 0.16, 990); setTimeout(function () { blip(990, 0.18, 'sine', 0.14, 1320); }, 90); },
+  alert: function () { blip(440, 0.22, 'square', 0.10, 880); },
+  caught: function () { blip(220, 0.5, 'sawtooth', 0.14, 55); },
+  win: function () { [523, 659, 784, 1046].forEach(function (f, i) { setTimeout(function () { blip(f, 0.22, 'sine', 0.15); }, i * 130); }); },
+  denied: function () { blip(140, 0.15, 'square', 0.08, 110); },
+};
+
+// ---------- input ----------
+const keys = {};
+let mouse = { x: 0, y: 0 };
+window.addEventListener('keydown', function (e) {
+  keys[e.key.toLowerCase()] = true;
+  if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].indexOf(e.key.toLowerCase()) >= 0) e.preventDefault();
+  if (e.key.toLowerCase() === 'm') { muted = !muted; }
+  if (e.key.toLowerCase() === 'r' && phase !== 'title') { resetGame(); startGame(); }
+  if (e.key.toLowerCase() === 'e' && phase === 'playing') { tryPickup(); }
+  if (e.key.toLowerCase() === 'enter' && phase !== 'playing') { startGame(); }
+});
+window.addEventListener('keyup', function (e) { keys[e.key.toLowerCase()] = false; });
+canvas.addEventListener('click', function (e) {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) * (W / r.width);
+  mouse.y = (e.clientY - r.top) * (H / r.height);
+  if (phase === 'playing') { player.clickX = mouse.x; player.clickY = mouse.y; player.detourX = null; player.detourY = null; player.detoursUsed = 0; player.stuckX = player.x; player.stuckY = player.y; }
+});
+document.getElementById('overlay').addEventListener('click', function (e) {
+  if (e.target && e.target.tagName === 'BUTTON') startGame();
+});
+
+// ---------- geometry helpers ----------
+function rectsOverlapCircle(r, cx, cy, rad) {
+  const nx = Math.max(r.x, Math.min(cx, r.x + r.w));
+  const ny = Math.max(r.y, Math.min(cy, r.y + r.h));
+  const dx = cx - nx, dy = cy - ny;
+  return dx * dx + dy * dy < rad * rad;
+}
+function circleHitsSolids(x, y, rad) {
+  for (let i = 0; i < solids.length; i++) if (rectsOverlapCircle(solids[i], x, y, rad)) return true;
+  return false;
+}
+function pointInRect(px, py, r) { return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h; }
+function inShadow(x, y) {
+  for (let i = 0; i < shadows.length; i++) if (pointInRect(x, y, shadows[i])) return true;
+  return false;
+}
+function segHitsRect(x1, y1, x2, y2, r) {
+  // segment vs rect: sample + edge test via Liang-Barsky
+  const dx = x2 - x1, dy = y2 - y1;
+  let t0 = 0, t1 = 1;
+  const p = [-dx, dx, -dy, dy], q = [x1 - r.x, r.x + r.w - x1, y1 - r.y, r.y + r.h - y1];
+  for (let i = 0; i < 4; i++) {
+    if (p[i] === 0) { if (q[i] < 0) return false; }
+    else {
+      const t = q[i] / p[i];
+      if (p[i] < 0) { if (t > t1) return false; if (t > t0) t0 = t; }
+      else { if (t < t0) return false; if (t < t1) t1 = t; }
+    }
+  }
+  return true;
+}
+function lineOfSight(x1, y1, x2, y2) {
+  for (let i = 0; i < solids.length; i++) if (segHitsRect(x1, y1, x2, y2, solids[i])) return false;
+  return true;
+}
+function angleDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+function canSee(ox, oy, facing, range, halfAngle, tx, ty) {
+  const dx = tx - ox, dy = ty - oy;
+  const d = Math.hypot(dx, dy);
+  if (d > range) return false;
+  if (Math.abs(angleDiff(Math.atan2(dy, dx), facing)) > halfAngle) return false;
+  return lineOfSight(ox, oy, tx, ty);
+}
+
+// ---------- game flow ----------
+function resetGame() {
+  player.x = 90; player.y = 640; player.clickX = null; player.clickY = null;
+  player.detourX = null; player.detourY = null; player.detoursUsed = 0;
+  player.stuckX = 90; player.stuckY = 640; player.stuckSince = 0;
+  alarm = 0; lootCount = 0; elapsed = 0; shake = 0; endReason = '';
+  lootItems.forEach(function (l) { l.taken = false; });
+  guards.forEach(function (g, i) {
+    g.x = g.waypoints[0][0]; g.y = g.waypoints[0][1];
+    g.wp = 1; g.wait = 0; g.state = 'calm'; g.suspicion = 0; g.chaseT = 0; g.returnT = 0;
+    g.dir = i * 2.1;
+  });
+}
+function startGame() {
+  resetGame();
+  phase = 'playing';
+  document.getElementById('overlay').style.display = 'none';
+  blip(520, 0.1, 'sine', 0.1, 780);
+}
+function endGame(won, reason) {
+  phase = won ? 'won' : 'lost';
+  endReason = reason;
+  if (won) sfx.win(); else sfx.caught();
+  showOverlay();
+}
+function tryPickup() {
+  for (let i = 0; i < lootItems.length; i++) {
+    const l = lootItems[i];
+    if (!l.taken && Math.hypot(player.x - l.x, player.y - l.y) < l.r + 26) {
+      l.taken = true; lootCount++;
+      sfx.pickup();
+      return;
+    }
+  }
+  sfx.denied();
+}
+function fmtTime(s) {
+  const m = Math.floor(s / 60), ss = Math.floor(s % 60);
+  return (m < 10 ? '0' : '') + m + ':' + (ss < 10 ? '0' : '') + ss;
+}
+
+// ---------- update ----------
+let lastStepSfx = 0;
+function update(dt) {
+  if (phase !== 'playing') return;
+  elapsed += dt;
+
+  // --- player movement ---
+  let mx = 0, my = 0;
+  if (keys['w'] || keys['arrowup']) my -= 1;
+  if (keys['s'] || keys['arrowdown']) my += 1;
+  if (keys['a'] || keys['arrowleft']) mx -= 1;
+  if (keys['d'] || keys['arrowright']) mx += 1;
+  player.sneaking = !!(keys['shift']);
+  if (mx || my) { player.clickX = null; player.clickY = null; player.detourX = null; player.detourY = null; }
+  else if (player.clickX !== null) {
+    // Click-to-move, with a detour when wedged on an obstacle corner:
+    // if the thief barely moves for 0.8s, step 90px sideways (first free
+    // direction) and then resume toward the clicked point.
+    const tx = player.detourX !== null ? player.detourX : player.clickX;
+    const ty = player.detourY !== null ? player.detourY : player.clickY;
+    const dx = tx - player.x, dy = ty - player.y;
+    const d = Math.hypot(dx, dy);
+    if (d < 8) {
+      if (player.detourX !== null) { player.detourX = null; player.detourY = null; }
+      else { player.clickX = null; player.clickY = null; }
+    } else {
+      mx = dx / d; my = dy / d;
+      const moved = Math.hypot(player.x - player.stuckX, player.y - player.stuckY);
+      if (moved > 10) { player.stuckX = player.x; player.stuckY = player.y; player.stuckSince = elapsed; }
+      else if (elapsed - player.stuckSince > 0.8) {
+        if (player.detourX === null && player.detoursUsed < 3) {
+          const px = -dy / d, py = dx / d;
+          const cands = [[px * 90, py * 90], [-px * 90, -py * 90], [mx * 90, my * 90], [-mx * 90, -my * 90]];
+          for (let ci = 0; ci < cands.length; ci++) {
+            const cx = player.x + cands[ci][0], cy = player.y + cands[ci][1];
+            if (cx > FLOOR.x + 30 && cx < FLOOR.x + FLOOR.w - 30 && cy > FLOOR.y + 30 && cy < FLOOR.y + FLOOR.h - 30 &&
+                !circleHitsSolids(cx, cy, player.r + 4)) {
+              player.detourX = cx; player.detourY = cy; player.detoursUsed++;
+              break;
+            }
+          }
+          if (player.detourX === null) { player.clickX = null; player.clickY = null; }
+          player.stuckX = player.x; player.stuckY = player.y; player.stuckSince = elapsed;
+        } else { player.clickX = null; player.clickY = null; player.detourX = null; player.detourY = null; }
+      }
+    }
+  }
+  const spd = player.sneaking ? player.sneakSpeed : player.speed;
+  if (mx || my) {
+    const len = Math.hypot(mx, my); mx /= len; my /= len;
+    player.facing = Math.atan2(my, mx);
+    player.moving = true;
+    const nx = player.x + mx * spd * dt, ny = player.y + my * spd * dt;
+    if (!circleHitsSolids(nx, player.y, player.r)) player.x = nx;
+    if (!circleHitsSolids(player.x, ny, player.r)) player.y = ny;
+    player.x = Math.max(FLOOR.x + 12 + player.r, Math.min(FLOOR.x + FLOOR.w - 12 - player.r, player.x));
+    player.y = Math.max(FLOOR.y + 12 + player.r, Math.min(FLOOR.y + FLOOR.h - 12 - player.r, player.y));
+    if (elapsed - lastStepSfx > 0.34) { lastStepSfx = elapsed; sfx.step(); }
+  } else player.moving = false;
+
+  const hidden = inShadow(player.x, player.y);
+  const sneakFactor = player.sneaking ? 0.45 : 1;
+  const shadowFactor = hidden ? 0.4 : 1;
+  let anySeen = false, anyAlerted = false, maxSuspicion = 0;
+
+  // --- guards ---
+  for (let i = 0; i < guards.length; i++) {
+    const g = guards[i];
+    const sees = canSee(g.x, g.y, g.dir, 230, 0.62, player.x, player.y);
+    if (sees) {
+      const dist = Math.hypot(player.x - g.x, player.y - g.y);
+      const rate = (46 - dist * 0.11) * sneakFactor * shadowFactor;
+      g.suspicion = Math.min(100, g.suspicion + Math.max(6, rate) * dt);
+      g.lastSeenX = player.x; g.lastSeenY = player.y;
+      anySeen = true;
+    } else {
+      g.suspicion = Math.max(0, g.suspicion - (hidden ? 26 : 12) * dt);
+    }
+    if (g.suspicion >= 62 && g.state !== 'alerted') {
+      g.state = 'alerted'; g.chaseT = 4; sfx.alert(); shake = 6;
+    }
+    if (g.state === 'alerted') {
+      anyAlerted = true;
+      g.chaseT -= dt;
+      const dx = player.x - g.x, dy = player.y - g.y, d = Math.hypot(dx, dy) || 1;
+      g.dir = Math.atan2(dy, dx);
+      const gx = g.x + (dx / d) * 118 * dt, gy = g.y + (dy / d) * 118 * dt;
+      if (!circleHitsSolids(gx, g.y, 14)) g.x = gx;
+      if (!circleHitsSolids(g.x, gy, 14)) g.y = gy;
+      if (d < 26) { endGame(false, 'A guard grabbed you in the gallery.'); return; }
+      if (g.chaseT <= 0 && !sees) { g.state = 'suspicious'; g.returnT = 3; }
+    } else if (g.suspicion >= 25) {
+      if (g.state !== 'suspicious') g.state = 'suspicious';
+      // suspicious guard creeps toward the last seen spot
+      const dx = g.lastSeenX - g.x, dy = g.lastSeenY - g.y, d = Math.hypot(dx, dy);
+      if (d > 12) {
+        g.dir = Math.atan2(dy, dx);
+        const gx = g.x + (dx / d) * 46 * dt, gy = g.y + (dy / d) * 46 * dt;
+        if (!circleHitsSolids(gx, g.y, 14)) g.x = gx;
+        if (!circleHitsSolids(g.x, gy, 14)) g.y = gy;
+      }
+      if (g.suspicion < 12) g.state = 'calm';
+    } else {
+      if (g.state !== 'calm') g.state = 'calm';
+      // patrol
+      if (g.wait > 0) { g.wait -= dt; }
+      else {
+        const tx = g.waypoints[g.wp][0], ty = g.waypoints[g.wp][1];
+        const dx = tx - g.x, dy = ty - g.y, d = Math.hypot(dx, dy);
+        if (d < 10) { g.wp = (g.wp + 1) % g.waypoints.length; g.wait = g.pause; }
+        else {
+          g.dir = Math.atan2(dy, dx);
+          const gx = g.x + (dx / d) * g.speed * dt, gy = g.y + (dy / d) * g.speed * dt;
+          if (!circleHitsSolids(gx, g.y, 14)) g.x = gx;
+          if (!circleHitsSolids(g.x, gy, 14)) g.y = gy;
+        }
+      }
+    }
+    if (g.suspicion > maxSuspicion) maxSuspicion = g.suspicion;
+  }
+
+  // --- cameras ---
+  let inCam = false;
+  for (let i = 0; i < cameras.length; i++) {
+    const c = cameras[i];
+    const ang = c.base + Math.sin(elapsed * c.speed + c.phase) * c.arc;
+    c.angle = ang;
+    if (canSee(c.x, c.y, ang, c.range, 0.42, player.x, player.y)) inCam = true;
+  }
+
+  // --- alarm meter ---
+  if (anyAlerted) alarm += 16 * dt;
+  else if (anySeen) alarm += 9 * dt;
+  if (inCam) alarm += 12 * dt;
+  if (!anySeen && !inCam && !anyAlerted) alarm -= (hidden ? 7 : 3.5) * dt;
+  alarm = Math.max(0, Math.min(100, alarm));
+  if (alarm >= 100) { endGame(false, 'The alarm hit 100% — the gallery locked down and the guards caught you.'); return; }
+
+  // --- exit ---
+  if (lootCount === 3 && player.x < exitDoor.x + exitDoor.w + 6 && player.y > exitDoor.y - 6 &&
+      player.x > exitDoor.x - 6 && player.y < exitDoor.y + exitDoor.h + 6) {
+    endGame(true, 'Clean getaway with all three treasures.');
+    return;
+  }
+  if (shake > 0) shake = Math.max(0, shake - dt * 14);
+
+  updateHud(anyAlerted, maxSuspicion);
+}
+
+// ---------- HUD ----------
+function updateHud(anyAlerted, maxSuspicion) {
+  const bar = document.getElementById('alarmBar');
+  bar.style.width = alarm.toFixed(1) + '%';
+  bar.style.background = alarm < 35 ? '#3fae5a' : alarm < 70 ? '#e0a32e' : '#d83a2e';
+  document.getElementById('alarmPct').textContent = Math.floor(alarm) + '%';
+  document.getElementById('loot').textContent = 'LOOT ' + lootCount + '/3' + (lootCount === 3 ? ' — GO TO EXIT!' : '');
+  document.getElementById('timer').textContent = fmtTime(elapsed);
+  const st = document.getElementById('state');
+  const label = anyAlerted ? 'ALERTED — RUN!' : maxSuspicion >= 25 ? 'SUSPICIOUS' : 'CALM';
+  st.textContent = 'GUARDS: ' + label;
+  st.style.color = anyAlerted ? '#ff6b5e' : maxSuspicion >= 25 ? '#ffd76a' : '#8fd8a0';
+}
+
+// ---------- render ----------
+function drawCone(x, y, facing, range, halfAngle, color) {
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.arc(x, y, range, facing - halfAngle, facing + halfAngle);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+function draw() {
+  ctx.save();
+  if (shake > 0) ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+  // floor
+  ctx.fillStyle = '#1b1b2a'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#20202f';
+  for (let x = FLOOR.x; x < FLOOR.x + FLOOR.w; x += 64)
+    for (let y = FLOOR.y; y < FLOOR.y + FLOOR.h; y += 64)
+      if (((x + y) / 64) % 2 === 0) ctx.fillRect(x, y, 64, 64);
+  // carpet runner down the middle
+  ctx.fillStyle = '#3d1f2b'; ctx.fillRect(600, FLOOR.y, 80, FLOOR.h);
+  ctx.strokeStyle = '#c9a227'; ctx.lineWidth = 2; ctx.strokeRect(600, FLOOR.y, 80, FLOOR.h);
+
+  // shadows
+  for (let i = 0; i < shadows.length; i++) {
+    const s = shadows[i];
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(s.x, s.y, s.w, s.h);
+    ctx.strokeStyle = 'rgba(120,140,255,0.25)'; ctx.strokeRect(s.x, s.y, s.w, s.h);
+  }
+  // exit door
+  const exitOpen = lootCount === 3;
+  ctx.fillStyle = exitOpen ? '#2f7d4f' : '#5a3a2a';
+  ctx.fillRect(exitDoor.x, exitDoor.y, exitDoor.w, exitDoor.h);
+  ctx.strokeStyle = exitOpen ? '#7dff9e' : '#c9a227'; ctx.lineWidth = 3;
+  ctx.strokeRect(exitDoor.x, exitDoor.y, exitDoor.w, exitDoor.h);
+  ctx.fillStyle = '#f5e9c8'; ctx.font = 'bold 13px Verdana'; ctx.textAlign = 'center';
+  ctx.fillText(exitOpen ? 'EXIT OPEN' : 'EXIT', exitDoor.x + exitDoor.w / 2, exitDoor.y + exitDoor.h / 2 - 4);
+  ctx.font = '11px Verdana';
+  ctx.fillText(exitOpen ? 'GO!' : 'LOCKED', exitDoor.x + exitDoor.w / 2, exitDoor.y + exitDoor.h / 2 + 12);
+
+  // vault antechamber label
+  ctx.fillStyle = 'rgba(255,215,106,0.75)'; ctx.font = 'bold 13px Georgia'; ctx.textAlign = 'left';
+  ctx.fillText('THE VAULT', 580, FLOOR.y + 50);
+
+  // loot
+  for (let i = 0; i < lootItems.length; i++) {
+    const l = lootItems[i];
+    if (l.taken) continue;
+    const pulse = 1 + Math.sin(elapsed * 4 + i) * 0.12;
+    ctx.beginPath(); ctx.arc(l.x, l.y, (l.r + 8) * pulse, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,215,106,0.14)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(l.x, l.y, l.r, 0, Math.PI * 2);
+    ctx.fillStyle = l.color; ctx.fill();
+    ctx.strokeStyle = '#14100a'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#14100a'; ctx.font = 'bold 18px Georgia'; ctx.textAlign = 'center';
+    ctx.fillText(l.glyph, l.x, l.y + 6);
+    ctx.fillStyle = '#f5e9c8'; ctx.font = '11px Verdana';
+    ctx.fillText(l.name, l.x, l.y - l.r - 8);
+  }
+
+  // camera cones (under characters, over floor)
+  for (let i = 0; i < cameras.length; i++) {
+    const c = cameras[i];
+    drawCone(c.x, c.y, c.angle || c.base, c.range, 0.42, 'rgba(255,60,60,0.16)');
+  }
+  // guard cones
+  for (let i = 0; i < guards.length; i++) {
+    const g = guards[i];
+    const col = g.state === 'alerted' ? 'rgba(255,40,40,0.30)' : g.state === 'suspicious' ? 'rgba(255,180,40,0.24)' : 'rgba(255,220,90,0.15)';
+    drawCone(g.x, g.y, g.dir, 230, 0.62, col);
+  }
+
+  // cover
+  for (let i = 0; i < cover.length; i++) {
+    const c = cover[i];
+    ctx.fillStyle = c.kind === 'crate' ? '#6b4a26' : c.kind === 'case' ? '#274b63' : '#4a4a58';
+    ctx.fillRect(c.x, c.y, c.w, c.h);
+    ctx.strokeStyle = '#c9a227'; ctx.lineWidth = 1.5; ctx.strokeRect(c.x, c.y, c.w, c.h);
+    ctx.fillStyle = 'rgba(245,233,200,0.8)'; ctx.font = '11px Verdana'; ctx.textAlign = 'center';
+    ctx.fillText(c.kind.toUpperCase(), c.x + c.w / 2, c.y + c.h / 2 + 4);
+  }
+  // walls
+  ctx.fillStyle = '#3a3a4d';
+  for (let i = 0; i < walls.length; i++) ctx.fillRect(walls[i].x, walls[i].y, walls[i].w, walls[i].h);
+  ctx.strokeStyle = '#c9a227'; ctx.lineWidth = 1;
+  for (let i = 0; i < walls.length; i++) ctx.strokeRect(walls[i].x, walls[i].y, walls[i].w, walls[i].h);
+
+  // cameras
+  for (let i = 0; i < cameras.length; i++) {
+    const c = cameras[i];
+    ctx.beginPath(); ctx.arc(c.x, c.y, 11, 0, Math.PI * 2);
+    ctx.fillStyle = '#222'; ctx.fill();
+    ctx.strokeStyle = '#ff4b4b'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(c.x, c.y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = '#ff4b4b'; ctx.fill();
+    ctx.fillStyle = '#ffb3b3'; ctx.font = 'bold 10px Verdana'; ctx.textAlign = 'left';
+    ctx.fillText('CAM', c.x + 14, c.y + 4);
+  }
+
+  // guards
+  for (let i = 0; i < guards.length; i++) {
+    const g = guards[i];
+    ctx.beginPath(); ctx.arc(g.x, g.y, 15, 0, Math.PI * 2);
+    ctx.fillStyle = g.state === 'alerted' ? '#c22' : g.state === 'suspicious' ? '#d8911c' : '#2e5fa3';
+    ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+    // facing tick
+    ctx.beginPath(); ctx.moveTo(g.x, g.y);
+    ctx.lineTo(g.x + Math.cos(g.dir) * 20, g.y + Math.sin(g.dir) * 20);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.stroke();
+    // suspicion arc
+    if (g.suspicion > 2) {
+      ctx.beginPath(); ctx.arc(g.x, g.y, 21, -Math.PI / 2, -Math.PI / 2 + (g.suspicion / 100) * Math.PI * 2);
+      ctx.strokeStyle = g.suspicion >= 62 ? '#ff3b30' : '#ffd76a'; ctx.lineWidth = 4; ctx.stroke();
+    }
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 10px Verdana'; ctx.textAlign = 'center';
+    ctx.fillText(g.state === 'alerted' ? '!' : g.state === 'suspicious' ? '?' : '', g.x, g.y - 20);
+  }
+
+  // player (Mara)
+  ctx.beginPath(); ctx.arc(player.x, player.y, player.r, 0, Math.PI * 2);
+  ctx.fillStyle = player.sneaking ? '#7a5fd0' : '#e8e8f2'; ctx.fill();
+  ctx.strokeStyle = '#ffd76a'; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(player.x, player.y);
+  ctx.lineTo(player.x + Math.cos(player.facing) * 20, player.y + Math.sin(player.facing) * 20);
+  ctx.strokeStyle = '#ffd76a'; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = '#14100a'; ctx.font = 'bold 12px Georgia'; ctx.textAlign = 'center';
+  ctx.fillText('M', player.x, player.y + 4);
+  if (inShadow(player.x, player.y)) {
+    ctx.fillStyle = 'rgba(160,180,255,0.9)'; ctx.font = '11px Verdana';
+    ctx.fillText('HIDDEN', player.x, player.y - 22);
+  }
+  if (player.sneaking) {
+    ctx.fillStyle = 'rgba(200,180,255,0.9)'; ctx.font = '11px Verdana';
+    ctx.fillText('SNEAKING', player.x, player.y + 28);
+  }
+  // click target
+  if (player.clickX !== null) {
+    ctx.beginPath(); ctx.arc(player.clickX, player.clickY, 7, 0, Math.PI * 2);
+    ctx.strokeStyle = '#ffd76a'; ctx.lineWidth = 2; ctx.stroke();
+  }
+  // pickup prompt
+  for (let i = 0; i < lootItems.length; i++) {
+    const l = lootItems[i];
+    if (!l.taken && Math.hypot(player.x - l.x, player.y - l.y) < l.r + 26) {
+      ctx.fillStyle = '#ffd76a'; ctx.font = 'bold 14px Verdana'; ctx.textAlign = 'center';
+      ctx.fillText('Press E — grab ' + l.name, player.x, player.y - 30);
+    }
+  }
+  // objective line
+  ctx.fillStyle = 'rgba(245,233,200,0.85)'; ctx.font = '13px Verdana'; ctx.textAlign = 'left';
+  ctx.fillText(lootCount < 3 ? 'Objective: steal all 3 treasures (' + lootCount + '/3)' : 'Objective: reach the green EXIT door!', 30, H - 14);
+
+  ctx.restore();
+}
+
+// ---------- overlays ----------
+function showOverlay() {
+  const o = document.getElementById('overlay');
+  o.style.display = 'flex';
+  if (phase === 'title') {
+    o.innerHTML =
+      '<h1>THE GILDED VAULT</h1>' +
+      '<h2>A night heist in the gilded gallery</h2>' +
+      '<p>You are <b>Mara</b>, a thief in the dark. Cross the gallery, steal the <b>Vault Gold</b>, ' +
+      'the <b>Gilded Portrait</b> and the <b>Safe Contents</b> — then slip out the service door.</p>' +
+      '<p>Guards patrol with yellow vision cones. Cameras sweep red cones. Being seen raises the ' +
+      '<b>ALARM</b> — hide in the dark <b>shadow patches</b> or behind crates to cool off. If the alarm fills, you are caught.</p>' +
+      '<p class="keys">WASD / arrows — move &nbsp;·&nbsp; Shift — sneak &nbsp;·&nbsp; E — grab loot &nbsp;·&nbsp; Click — walk there &nbsp;·&nbsp; R — restart &nbsp;·&nbsp; M — mute</p>' +
+      '<button id="startBtn">BEGIN THE HEIST</button>';
+    document.getElementById('startBtn').addEventListener('click', startGame);
+  } else if (phase === 'won') {
+    o.innerHTML =
+      '<h1>CLEAN GETAWAY!</h1>' +
+      '<p class="big">' + endReason + '</p>' +
+      '<p>All 3 treasures stolen in ' + fmtTime(elapsed) + ' — final alarm ' + Math.floor(alarm) + '%.</p>' +
+      '<p class="keys">Press R or Enter to play again</p>' +
+      '<button id="againBtn">STEAL AGAIN</button>';
+    document.getElementById('againBtn').addEventListener('click', startGame);
+  } else {
+    o.innerHTML =
+      '<h1>CAUGHT!</h1>' +
+      '<p class="big">' + endReason + '</p>' +
+      '<p>Loot stolen: ' + lootCount + '/3 &nbsp;·&nbsp; Survived ' + fmtTime(elapsed) + '</p>' +
+      '<p class="keys">Press R or Enter to try again</p>' +
+      '<button id="againBtn">TRY AGAIN</button>';
+    document.getElementById('againBtn').addEventListener('click', startGame);
+  }
+}
+
+// ---------- main loop ----------
+let lastT = 0;
+function loop(t) {
+  const dt = Math.min(0.05, (t - lastT) / 1000 || 0.016);
+  lastT = t;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+showOverlay();
+updateHud(false, 0);
+requestAnimationFrame(loop);
+
+// Test hooks for automated playtesting (not part of gameplay).
+window.__heist = {
+  get phase() { return phase; },
+  get alarm() { return alarm; },
+  get loot() { return lootCount; },
+  get elapsed() { return elapsed; },
+  get player() { return { x: player.x, y: player.y }; },
+  get guards() { return guards.map(function (g) { return { x: g.x, y: g.y, dir: g.dir, state: g.state, suspicion: g.suspicion }; }); },
+  start: startGame,
+  teleport: function (x, y) { player.x = x; player.y = y; player.clickX = null; player.clickY = null; player.detourX = null; player.detourY = null; },
+  setAlarm: function (v) { alarm = v; },
+  pickup: tryPickup,
+};
+</script>
+</body>
+</html>
